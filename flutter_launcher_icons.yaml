@@ -1,0 +1,7 @@
+flutter_launcher_icons:
+  android: true
+  ios: true 
+  image_path: "assets/icon/icon.png"
+  adaptive_icon_background: "#51a1d4" # sampled sky-blue from the source artwork
+  adaptive_icon_foreground: "assets/icon/icon_foreground.png"
+  min_sdk_android: 26 # matches this project's existing minSdk
