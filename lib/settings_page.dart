@@ -103,7 +103,7 @@ class _SettingsPageState extends State<SettingsPage> {
                       border: OutlineInputBorder(),
                     ),
                   ),
-                  const SizedBox(height: 32),
+                  const SizedBox(height: 24),
                   ElevatedButton(
                     onPressed: _save,
                     child: const Padding(

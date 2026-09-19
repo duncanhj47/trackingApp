@@ -263,13 +263,13 @@ packages:
     source: hosted
     version: "2.0.35"
   flutter_rust_bridge:
-    dependency: "direct overridden"
+    dependency: transitive
     description:
       name: flutter_rust_bridge
-      sha256: e87d6b9ee934dcd24a128ccb2bd91905d2d5fe5c06245d6a8f5477d4907a437a
+      sha256: ec69331e2335ab4d456c0a9fc700892c2c85b72b9c0cb39df3ecfe8833d5d5c8
       url: "https://pub.dev"
     source: hosted
-    version: "2.12.0"
+    version: "2.13.0"
   flutter_test:
     dependency: "direct dev"
     description: flutter
@@ -849,50 +849,50 @@ packages:
     dependency: "direct main"
     description:
       name: tracelet
-      sha256: "1c7fca310979a5b3f7a5fe77eb2cc7daccf937d4633471f84010c7f6cd1fdbaf"
+      sha256: "061a97ca7e1c33e88c99bb203884bf98844d0224441033f3e95cdac9d850b80a"
       url: "https://pub.dev"
     source: hosted
-    version: "3.8.7"
+    version: "3.8.8"
   tracelet_android:
     dependency: transitive
     description:
       name: tracelet_android
-      sha256: "4aef7454a4eceff9d8f2d22266549773c2a01c0c0c2374db09f7ffea41b0d587"
+      sha256: "4ef1183c48aad095f9ad2bb7f68dd41c9fdc900a052df2c665f1b9e7dcdb68be"
       url: "https://pub.dev"
     source: hosted
-    version: "3.8.7"
+    version: "3.8.8"
   tracelet_doctor:
     dependency: "direct main"
     description:
       name: tracelet_doctor
-      sha256: "6754295a689bd528c488189d7d3e8ee6b1b6984229270a6b2e51d735a6900af3"
+      sha256: "742a8584ac6198b04d192af680aed4570941f9597bcacedd994290f62f7c77db"
       url: "https://pub.dev"
     source: hosted
-    version: "3.8.7"
+    version: "3.8.8"
   tracelet_ios:
     dependency: transitive
     description:
       name: tracelet_ios
-      sha256: f3d0e60c3f50cacc62fabd1698c76117f234c3e656627675700e6abf9cbde259
+      sha256: "660cb9301602693f8fedce3ccfeafbd3892e07d174c2af0a2a6cf178a5f59b9c"
       url: "https://pub.dev"
     source: hosted
-    version: "3.8.7"
+    version: "3.8.8"
   tracelet_platform_interface:
     dependency: transitive
     description:
       name: tracelet_platform_interface
-      sha256: "033d2572a512066cfd3e1702e32b9d746e179fae76d8e7e93a7a97a678151318"
+      sha256: "2e2d064de55ace961f28ef32300d46ec688ac948c3753fc7509665c6b0083e55"
       url: "https://pub.dev"
     source: hosted
-    version: "3.8.7"
+    version: "3.8.8"
   tracelet_web:
     dependency: transitive
     description:
       name: tracelet_web
-      sha256: ef560c0d2a493e14e0c90a70adce4e852a05733bebdcb032967f66bddbfea630
+      sha256: "41a7210be768de406a9bc70aa01923e2e8b7c52ec9499a6cde7dfaa4a09a9847"
       url: "https://pub.dev"
     source: hosted
-    version: "3.8.7"
+    version: "3.8.8"
   typed_data:
     dependency: transitive
     description:

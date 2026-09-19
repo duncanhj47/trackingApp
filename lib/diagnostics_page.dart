@@ -3,6 +3,9 @@ import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 import 'package:tracelet_doctor/tracelet_doctor.dart';
 
+import 'app_log_page.dart';
+import 'logs_page.dart';
+
 class DiagnosticsPage extends StatelessWidget {
   const DiagnosticsPage({
     super.key,
@@ -13,6 +16,9 @@ class DiagnosticsPage extends StatelessWidget {
     required this.lastSendStatus,
     required this.pendingCount,
     required this.totalSentCount,
+    required this.lastHeartbeatUtc,
+    required this.heartbeatCount,
+    required this.heartbeatIsMoving,
   });
 
   final String fleetId;
@@ -22,6 +28,31 @@ class DiagnosticsPage extends StatelessWidget {
   final String lastSendStatus;
   final int pendingCount;
   final int totalSentCount;
+  final String? lastHeartbeatUtc;
+  final int heartbeatCount;
+  final bool? heartbeatIsMoving;
+
+  /// Heartbeat timestamps are stamped via DateTime.now().toUtc() — see
+  /// real_location_source.dart — so this mirrors the same UTC-forcing
+  /// approach used in logs_page.dart rather than trusting string
+  /// punctuation to say so.
+  String? _formatHeartbeatLocal() {
+    final raw = lastHeartbeatUtc;
+    if (raw == null) return null;
+    try {
+      var parsed = DateTime.parse(raw);
+      if (!parsed.isUtc) {
+        parsed = DateTime.utc(parsed.year, parsed.month, parsed.day,
+            parsed.hour, parsed.minute, parsed.second);
+      }
+      final local = parsed.toLocal();
+      String pad(int n) => n.toString().padLeft(2, '0');
+      return '${local.year}-${pad(local.month)}-${pad(local.day)} '
+          '${pad(local.hour)}:${pad(local.minute)}:${pad(local.second)}';
+    } catch (_) {
+      return raw;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -57,6 +88,32 @@ class DiagnosticsPage extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           _SectionCard(
+            title: 'Heartbeat',
+            rows: [
+              _DiagRow(
+                'Last heartbeat',
+                _formatHeartbeatLocal() ?? 'None yet',
+                warn: lastHeartbeatUtc == null,
+              ),
+              _DiagRow(
+                'Device state at last beat',
+                heartbeatIsMoving == null
+                    ? 'Unknown'
+                    : (heartbeatIsMoving! ? 'Moving' : 'Motionless'),
+              ),
+              _DiagRow('Total heartbeats seen', '$heartbeatCount'),
+            ],
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(4, 6, 4, 0),
+            child: Text(
+              'Only fires while parked/stationary — a long gap while '
+              'driving is expected, not a fault.',
+              style: TextStyle(fontSize: 11, color: Colors.grey[600]),
+            ),
+          ),
+          const SizedBox(height: 12),
+          _SectionCard(
             title: 'Sync Queue',
             rows: [
               _DiagRow(
@@ -68,13 +125,21 @@ class DiagnosticsPage extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 20),
-          if (!Platform.isLinux)
+          if (!Platform.isLinux) ...[
             FilledButton.icon(
               onPressed: () => TraceletDoctor.show(context),
               icon: const Icon(Icons.health_and_safety),
               label: const Text('Show Device & GPS Health'),
-            )
-          else
+            ),
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (context) => const LogsPage()),
+              ),
+              icon: const Icon(Icons.article_outlined),
+              label: const Text('View Tracking Logs'),
+            ),
+          ] else
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(16),
@@ -86,6 +151,14 @@ class DiagnosticsPage extends StatelessWidget {
                 ),
               ),
             ),
+          const SizedBox(height: 10),
+          OutlinedButton.icon(
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (context) => const AppLogPage()),
+            ),
+            icon: const Icon(Icons.pending_actions_outlined),
+            label: const Text('View App Log'),
+          ),
         ],
       ),
     );

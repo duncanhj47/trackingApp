@@ -11,6 +11,16 @@ abstract class LocationSource {
   Future<void> start();
   Future<void> stop();
 
+  /// Whether the underlying engine is actually tracking right now — not
+  /// this object's own assumption about its last known state. See
+  /// TraceletLocationSource.isTracking() for why that distinction matters.
+  Future<bool> isTracking();
+
+  /// True while running in low-power (significant-change-only) mode —
+  /// i.e. confirmed parked, GPS/motion-detection pipeline stood down.
+  /// Always false on the simulator, which has no such distinction.
+  bool get isInLowPowerMode;
+
   /// A one-off reading, independent of the continuous distance-filtered
   /// stream — used for a manual "send current position now" action.
   Future<TrackedLocation> getCurrentPosition();
@@ -54,6 +64,15 @@ class SimulatedLocationSource implements LocationSource {
     _timer?.cancel();
     _timer = null;
   }
+
+  // In-memory truth is always accurate here — this whole object lives and
+  // dies with the process, unlike the real Tracelet engine which persists
+  // independently of this Dart object's lifecycle.
+  @override
+  Future<bool> isTracking() async => _timer != null;
+
+  @override
+  bool get isInLowPowerMode => false;
 
   @override
   Future<TrackedLocation> getCurrentPosition() async {

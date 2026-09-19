@@ -12,6 +12,7 @@ import 'package:sqflite/sqflite.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 import 'api_client.dart';
+import 'app_log_store.dart';
 import 'diagnostics_page.dart';
 import 'location_source.dart';
 import 'pending_location_store.dart';
@@ -23,6 +24,13 @@ void main() {
   if (Platform.isLinux || Platform.isWindows || Platform.isMacOS) {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
+  }
+
+  // Must run before runApp() per Tracelet's docs. Guarded the same way
+  // _createLocationSource() picks the simulator — Tracelet has no Linux
+  // implementation, so this would have nothing to register against there.
+  if (!Platform.isLinux) {
+    registerTraceletHeadlessTask();
   }
 
   runApp(const VehicleTrackerApp());
@@ -52,7 +60,8 @@ class TrackerHomePage extends StatefulWidget {
   State<TrackerHomePage> createState() => _TrackerHomePageState();
 }
 
-class _TrackerHomePageState extends State<TrackerHomePage> {
+class _TrackerHomePageState extends State<TrackerHomePage>
+    with WidgetsBindingObserver {
   String? _fleetId;
   String _serverAddress = defaultServerAddress;
   String? _apiKey;
@@ -70,13 +79,192 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
   int _totalSentCount = 0;
   Timer? _flushTimer;
 
+  // Independent of Tracelet entirely — see app_log_store.dart. Proves this
+  // app's own Dart isolate is being scheduled at all, on a clock this app
+  // owns end to end.
+  final _appLogStore = AppLogStore();
+  Timer? _appPulseTimer;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadSettings();
     _updatePendingCount();
     _flushTimer = Timer.periodic(const Duration(seconds: 20), (_) => _flushQueue());
     _requestNotificationPermissionOnce();
+    // Cold start (including iOS relaunching the app after killing it in
+    // the background) — this widget's own `_tracking = false` default is
+    // just a guess until checked against what the native engine is
+    // actually doing.
+    _resumeTrackingIfIntended();
+
+    _appLogStore.add('App launched');
+    _appPulseTimer = Timer.periodic(
+      const Duration(minutes: 5),
+      (_) => _recordAppPulse(),
+    );
+  }
+
+  /// Cold-start recovery. Different from the foreground-resume check
+  /// below (didChangeAppLifecycleState), which just reads Tracelet's
+  /// current state — this is specifically for a genuine process kill.
+  ///
+  /// Found 2026-09-14 → 2026-09-15 overnight: on a true cold start,
+  /// isTracking()'s getState() call came back with a blank default
+  /// (engineEnabled=false, odometer=0) rather than the real persisted
+  /// session — Tracelet's own log confirmed ready()/start() were never
+  /// called again in that fresh process at all. That was very likely
+  /// caused by my own earlier change to isTracking() (removing its
+  /// _ensureReady() call to fix a different, real problem — repeated
+  /// ready() calls on ordinary foreground events). This restores that
+  /// re-initialization, but only for a genuine cold start, specifically
+  /// to avoid reintroducing the problem that first fix solved.
+  ///
+  /// Persisted intent, not the ephemeral `_tracking` bool, is what's
+  /// checked here — `_tracking` resets to false by construction on every
+  /// fresh process and would tell us nothing about what was intended.
+  Future<void> _resumeTrackingIfIntended() async {
+    if (Platform.isLinux) {
+      await _syncTrackingStateFromNative();
+      return;
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    final intendedTracking = prefs.getBool(trackingIntentPrefsKey) ?? false;
+
+    if (!intendedTracking) {
+      await _syncTrackingStateFromNative();
+      return;
+    }
+
+    await _ensureLocationSource();
+    final actuallyTracking = await _locationSource!.isTracking();
+    if (actuallyTracking) {
+      // A session that genuinely survived the relaunch — just confirm
+      // the UI, nothing to resume.
+      if (mounted) setState(() => _tracking = true);
+      return;
+    }
+
+    _appLogStore.add(
+      'Cold start: intent was tracking=true but native reported false — '
+      'calling start() to actively resume rather than mirroring blank state',
+    );
+    await _locationSource!.start();
+    if (mounted) setState(() => _tracking = true);
+  }
+
+  /// The independent "is the app itself still alive" signal requested
+  /// separately from Tracelet's own heartbeat. Records current tracking
+  /// status as cheap, useful context — not because this depends on
+  /// Tracelet in any way, just because "was the app alive AND did it
+  /// still think it was tracking" is more useful than "was the app alive"
+  /// alone, at zero extra cost.
+  ///
+  /// Stated plainly: this can only fire while the Dart isolate is
+  /// actually running. A gap in this log on a phone that stayed on the
+  /// whole time IS the finding — it pinpoints exactly when the app's own
+  /// process stopped being scheduled, independent of anything Tracelet
+  /// reports about itself.
+  void _recordAppPulse() {
+    _appLogStore.add('Pulse — tracking=$_tracking');
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) async {
+    if (state == AppLifecycleState.resumed) {
+      // How long since this app's own log last wrote anything —
+      // directly measures how long the Dart isolate itself was frozen,
+      // independent of whatever Tracelet reports about its own engine.
+      // Read BEFORE adding this resume's own entry, or it would just
+      // measure itself.
+      final priorEntries = await _appLogStore.recent(limit: 1);
+      if (priorEntries.isNotEmpty) {
+        final gap = DateTime.now()
+            .toUtc()
+            .difference(priorEntries.first.timestampUtc);
+        _appLogStore.add(
+            'Lifecycle: resumed — ${_formatDuration(gap)} since last app-log entry');
+      } else {
+        _appLogStore.add('Lifecycle: resumed');
+      }
+
+      // A second, independent measurement: how long since Tracelet's own
+      // engine last proved life via a heartbeat. This can legitimately
+      // be long while driving (heartbeat is stationary-only) — read it
+      // alongside the state snapshot below, not in isolation.
+      final prefs = await SharedPreferences.getInstance();
+      final lastHeartbeatUtc = prefs.getString(heartbeatTimestampPrefsKey);
+      if (lastHeartbeatUtc != null) {
+        final beatGap = DateTime.now()
+            .toUtc()
+            .difference(DateTime.parse(lastHeartbeatUtc));
+        _appLogStore
+            .add('Time since last Tracelet heartbeat: ${_formatDuration(beatGap)}');
+      }
+
+      await _logTraceletSnapshot('Resumed, Tracelet state');
+
+      // Coming back to the foreground doesn't necessarily mean the
+      // process was killed — but it's exactly the moment a native-side
+      // change (an OS-level stop, a background failure, or a
+      // kill-and-relaunch that happened while the screen was off) would
+      // otherwise go unnoticed until the next button press. This is the
+      // fix for "brought it forward and the button said Start Tracking,
+      // but I never touched it".
+      await _syncTrackingStateFromNative();
+    } else {
+      _appLogStore.add('Lifecycle: ${state.name}');
+      if (state == AppLifecycleState.paused) {
+        // A "last known good" snapshot immediately before backgrounding,
+        // to bookend against whatever gets logged on the next resume —
+        // the difference between these two IS the failure window, if
+        // one opens up.
+        await _logTraceletSnapshot('Backgrounding, Tracelet state');
+      }
+    }
+  }
+
+  /// The OS telling the app it's under memory pressure — a direct,
+  /// previously-untapped signal for the exact "silently killed with no
+  /// crash log, no Jetsam event" failure chased on 2026-09-14. If this
+  /// fires shortly before a gap begins, that's real evidence pointing at
+  /// memory pressure specifically, rather than the OS's background
+  /// execution budget declining to wake the app for other reasons.
+  @override
+  void didHaveMemoryPressure() {
+    _appLogStore.add('⚠ OS memory pressure warning received');
+  }
+
+  Future<void> _logTraceletSnapshot(String label) async {
+    if (Platform.isLinux) return; // Nothing Tracelet-specific to read.
+    final snapshot = await traceletStateSnapshot();
+    _appLogStore.add('$label — $snapshot');
+  }
+
+  String _formatDuration(Duration d) {
+    final hours = d.inHours;
+    final minutes = d.inMinutes % 60;
+    if (hours > 0) return '${hours}h ${minutes}m';
+    return '${minutes}m';
+  }
+
+  /// Re-checks the native engine's actual tracking state and corrects
+  /// `_tracking` if it disagrees. `_tracking` is only ever this widget's
+  /// in-memory assumption, set by `_toggleTracking()` — nothing previously
+  /// kept it honest against what Tracelet is actually doing underneath.
+  Future<void> _syncTrackingStateFromNative() async {
+    if (Platform.isLinux) return; // Simulator's own state can't diverge.
+    await _ensureLocationSource();
+    final actuallyTracking = await _locationSource!.isTracking();
+    if (mounted && actuallyTracking != _tracking) {
+      _appLogStore.add(
+        'Tracking state corrected — UI said $_tracking, '
+        'native said $actuallyTracking',
+      );
+      setState(() => _tracking = actuallyTracking);
+    }
   }
 
   /// Requests notification permission exactly once, ever — tracked with
@@ -97,7 +285,9 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _flushTimer?.cancel();
+    _appPulseTimer?.cancel();
     _locationSource?.dispose();
     super.dispose();
   }
@@ -128,7 +318,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
     if (Platform.isLinux) {
       return SimulatedLocationSource();
     }
-    return TraceletLocationSource();
+    return TraceletLocationSource(appLog: _appLogStore);
   }
 
   /// Creates the location source and attaches its stream listener exactly
@@ -191,7 +381,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
 
     if ((_fleetId == null || _fleetId!.isEmpty) ||
         (_apiKey == null || _apiKey!.isEmpty)) {
-      setState(() => _lastSendStatus = 'Not sent — Fleet ID/API Key not set');
+      _setSendStatus('Not sent — Fleet ID/API Key not set');
       return;
     }
 
@@ -199,19 +389,47 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
     try {
       await apiClient.postLocation(_fleetId!, location);
       await _incrementTotalSent();
-      setState(() => _lastSendStatus = 'Sent at ${_formatDateTime(DateTime.now())}');
+      _setSendStatus('Sent at ${_formatDateTime(DateTime.now())}');
     } catch (e) {
       await _pendingStore.add(_fleetId!, location);
       await _updatePendingCount();
-      setState(() => _lastSendStatus = 'Send failed — cached for retry');
+      _setSendStatus('Send failed — cached for retry');
     }
 
     await _flushQueue();
   }
 
+  /// Every location fix goes through here while driving — logging every
+  /// single one to the app log would flood it in minutes. Only the
+  /// *category* transition (ok → failed, failed → ok, etc.) is logged,
+  /// not every fix, which keeps the log about what changed rather than a
+  /// duplicate of the location stream itself.
+  String? _lastLoggedSendCategory;
+
+  void _setSendStatus(String status) {
+    setState(() => _lastSendStatus = status);
+    final category = status.startsWith('Sent at')
+        ? 'ok'
+        : status.startsWith('Send failed')
+            ? 'failed'
+            : 'blocked';
+    if (category != _lastLoggedSendCategory) {
+      _appLogStore.add('Send status changed: $status');
+      _lastLoggedSendCategory = category;
+    }
+  }
+
+  // Guards against re-logging "flush failed" every 20 seconds for the
+  // whole duration of an outage — only the start of a failed streak is
+  // worth a line, not every retry of it.
+  bool _pendingBacklogFailureLogged = false;
+
   Future<void> _flushQueue() async {
     if (_apiKey == null || _apiKey!.isEmpty) return;
     final apiClient = ApiClient(serverAddress: _serverAddress, apiKey: _apiKey!);
+    final startCount = await _pendingStore.count();
+    var sentThisPass = 0;
+    var hitFailure = false;
 
     while (true) {
       final batch = await _pendingStore.peekOldest(limit: 50);
@@ -227,22 +445,53 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
           );
           await _pendingStore.remove(pending.id);
           await _incrementTotalSent();
+          sentThisPass++;
         } catch (_) {
           anyFailed = true;
+          hitFailure = true;
           break;
         }
       }
       if (anyFailed) break;
     }
 
+    // This runs on a 20-second timer as well as after every fix — logging
+    // every silent no-op tick (or every retry of an ongoing outage) would
+    // swamp the log. Only worth a line when something actually changed:
+    // the backlog drained, or a failure streak just started.
+    if (sentThisPass > 0) {
+      _appLogStore.add('Flushed $sentThisPass cached location(s) to server');
+      _pendingBacklogFailureLogged = false;
+    } else if (hitFailure && startCount > 0 && !_pendingBacklogFailureLogged) {
+      _appLogStore.add('Flush attempt failed — $startCount still queued');
+      _pendingBacklogFailureLogged = true;
+    }
+
     await _updatePendingCount();
   }
 
   Future<void> _openSettings() async {
+    final prevFleetId = _fleetId;
+    final prevServer = _serverAddress;
+    final prevApiKeySet = _apiKey != null && _apiKey!.isNotEmpty;
+
+    _appLogStore.add('Settings screen opened');
     await Navigator.of(context).push(
       MaterialPageRoute(builder: (context) => const SettingsPage()),
     );
-    _loadSettings();
+    await _loadSettings();
+
+    // Never log the API key's value itself — just whether it changed.
+    final changes = <String>[];
+    if (_fleetId != prevFleetId) changes.add('Fleet ID');
+    if (_serverAddress != prevServer) changes.add('server address');
+    final newApiKeySet = _apiKey != null && _apiKey!.isNotEmpty;
+    if (newApiKeySet != prevApiKeySet) changes.add('API key presence');
+    _appLogStore.add(
+      changes.isEmpty
+          ? 'Settings screen closed — no changes'
+          : 'Settings screen closed — changed: ${changes.join(', ')}',
+    );
   }
 
   Future<bool> _ensurePermissions() async {
@@ -272,11 +521,14 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
   Future<void> _toggleTracking() async {
     if (_tracking) {
       await _locationSource?.stop();
+      await _persistTrackingIntent(false);
+      _appLogStore.add('Stop Tracking pressed');
       setState(() => _tracking = false);
       return;
     }
 
     if (!_settingsAreComplete()) {
+      _appLogStore.add('Start Tracking blocked — Fleet ID/API Key not set');
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Set Fleet ID and API Key in Settings first')),
       );
@@ -285,6 +537,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
 
     final hasPermission = await _ensurePermissions();
     if (!hasPermission) {
+      _appLogStore.add('Start Tracking blocked — location permission denied');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -297,11 +550,19 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
 
     await _ensureLocationSource();
     await _locationSource!.start();
+    await _persistTrackingIntent(true);
+    _appLogStore.add('Start Tracking pressed — tracking started');
     setState(() => _tracking = true);
+  }
+
+  Future<void> _persistTrackingIntent(bool intent) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(trackingIntentPrefsKey, intent);
   }
 
   Future<void> _sendCurrentPositionNow() async {
     if (!_settingsAreComplete()) {
+      _appLogStore.add('Send Now blocked — Fleet ID/API Key not set');
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Set Fleet ID and API Key in Settings first')),
       );
@@ -310,6 +571,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
 
     final hasPermission = await _ensurePermissions();
     if (!hasPermission) {
+      _appLogStore.add('Send Now blocked — location permission denied');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Location permission is required')),
@@ -321,8 +583,10 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
     await _ensureLocationSource();
     try {
       final location = await _locationSource!.getCurrentPosition();
+      _appLogStore.add('Send Now pressed — got a fix, handing off to send');
       await _handleLocation(location);
     } catch (e) {
+      _appLogStore.add('Send Now failed — could not get current position: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Could not get current position: $e')),
@@ -333,6 +597,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
 
   Future<void> _addPointOfInterest() async {
     if (!_settingsAreComplete()) {
+      _appLogStore.add('POI submission blocked — Fleet ID/API Key not set');
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Set Fleet ID and API Key in Settings first')),
       );
@@ -478,6 +743,7 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
 
     final hasPermission = await _ensurePermissions();
     if (!hasPermission) {
+      _appLogStore.add('POI submission blocked — location permission denied');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Location permission is required')),
@@ -520,12 +786,16 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
         photoBase64: photoBase64,
       );
       await _handleLocation(withNote);
+      _appLogStore.add(
+        'POI added — type=$type${photoBase64 != null ? ', with photo' : ''}',
+      );
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Point of interest submitted')),
         );
       }
     } catch (e) {
+      _appLogStore.add('POI submission failed — could not get position: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Could not get position: $e')),
@@ -539,6 +809,10 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
     // overlay has something real to report rather than an uninitialized
     // plugin — harmless no-op if it's already set up.
     await _ensureLocationSource();
+    final prefs = await SharedPreferences.getInstance();
+    final lastHeartbeatUtc = prefs.getString(heartbeatTimestampPrefsKey);
+    final heartbeatCount = prefs.getInt(heartbeatCountPrefsKey) ?? 0;
+    final heartbeatIsMoving = prefs.getBool(heartbeatIsMovingPrefsKey);
     if (!mounted) return;
     await Navigator.of(context).push(
       MaterialPageRoute(
@@ -550,6 +824,9 @@ class _TrackerHomePageState extends State<TrackerHomePage> {
           lastSendStatus: _lastSendStatus,
           pendingCount: _pendingCount,
           totalSentCount: _totalSentCount,
+          lastHeartbeatUtc: lastHeartbeatUtc,
+          heartbeatCount: heartbeatCount,
+          heartbeatIsMoving: heartbeatIsMoving,
         ),
       ),
     );

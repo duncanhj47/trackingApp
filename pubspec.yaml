@@ -99,4 +99,3 @@ flutter:
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
 dependency_overrides:
-  flutter_rust_bridge: 2.12.0
